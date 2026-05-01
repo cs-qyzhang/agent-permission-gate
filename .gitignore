@@ -1,0 +1,10 @@
+# Environment secrets
+.env
+
+# Logs
+permission.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
