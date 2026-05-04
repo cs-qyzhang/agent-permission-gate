@@ -123,6 +123,7 @@ INTERNAL_TOOLS = {
     "CronDelete",
     "CronList",
     "ScheduleWakeup",
+    "TodoWrite",
 }
 
 
