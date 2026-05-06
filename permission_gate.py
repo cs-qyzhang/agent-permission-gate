@@ -68,7 +68,7 @@ _load_dotenv()
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = SCRIPT_DIR / "permission_gate.json"
+DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
 
 MODEL = os.environ.get("CLAUDE_GATE_MODEL", "claude-haiku-4-5")
 BASE_URL = os.environ.get("ANTHROPIC_BASE_URL") or None
@@ -241,9 +241,13 @@ def load_config() -> Dict[str, Any]:
     allowed_mcp_patterns.extend(config.get("allowed_mcp_patterns", []))
     allowed_mcp_patterns.extend(split_env_list("CLAUDE_GATE_ALLOWED_MCP_PATTERNS"))
 
+    all_modes = ["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"]
+    enabled_modes = set(config.get("enabled_modes", all_modes))
+
     return {
         "allowed_mcp_tools": allowed_mcp_tools,
         "allowed_mcp_patterns": allowed_mcp_patterns,
+        "enabled_modes": enabled_modes,
     }
 
 
@@ -1029,8 +1033,7 @@ def llm_decide(event: Dict[str, Any], preliminary_reason: str) -> Tuple[str, str
 # Main decision flow
 # ---------------------------------------------------------------------------
 
-def decide(event: Dict[str, Any]) -> Tuple[str, str]:
-    config = load_config()
+def decide(event: Dict[str, Any], config: Dict[str, Any]) -> Tuple[str, str]:
 
     tool_name = str(event.get("tool_name", ""))
     tool_input = event.get("tool_input") or {}
@@ -1083,8 +1086,15 @@ def main() -> None:
 
     log_debug(f"[INPUT] {json.dumps(event, ensure_ascii=False)[:8000]}")
 
+    # Check if the current permission mode is in the enabled list.
+    config = load_config()
+    current_mode = event.get("permission_mode", "default")
+    if current_mode not in config["enabled_modes"]:
+        log_debug(f"[MODE] {current_mode} not in enabled_modes {config['enabled_modes']}; passing through.")
+        sys.exit(0)
+
     try:
-        decision, reason = decide(event)
+        decision, reason = decide(event, config)
     except Exception as e:
         decision, reason = "ask", f"Permission gate internal error: {type(e).__name__}: {e}"
 

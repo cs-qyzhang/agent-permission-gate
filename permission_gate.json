@@ -1,4 +1,0 @@
-{
-  "allowed_mcp_tools": ["mcp__context7__resolve-library-id"],
-  "allowed_mcp_patterns": ["^mcp__context7__.*$", "^mcp__serper-search.*$"]
-}

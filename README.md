@@ -44,7 +44,7 @@ Then configure Claude Code (`~/.claude/settings.json`) to use the hook:
 | `ANTHROPIC_API_KEY` | API key for LLM fallback decisions | (required for LLM fallback) |
 | `ANTHROPIC_BASE_URL` | Custom Anthropic-compatible API endpoint | `https://api.anthropic.com` |
 | `CLAUDE_GATE_MODEL` | Model for fallback classification | `claude-haiku-4-5` |
-| `CLAUDE_GATE_CONFIG` | Path to JSON config file for MCP allowlists | `~/.claude/hooks/permission_gate.json` |
+| `CLAUDE_GATE_CONFIG` | Path to JSON config file for MCP allowlists | `~/.claude/hooks/config.json` |
 | `CLAUDE_GATE_ALLOWED_MCP_TOOLS` | Comma-separated extra MCP tool names to allow | (none) |
 | `CLAUDE_GATE_ALLOWED_MCP_PATTERNS` | Comma-separated extra MCP regex patterns to allow | (none) |
 | `CLAUDE_GATE_LOG` | Path for debug logs | (disabled if empty) |
@@ -79,9 +79,34 @@ Read, Glob, Grep, LS (unless referencing sensitive paths like `.env`, `.ssh`, cr
 
 Commands with shell control operators (`&&`, `||`, `|`, `;`, `` ` ``, `$()`, `>`, `<`, newlines) or references to sensitive paths are escalated to LLM fallback.
 
+## Permission Modes
+
+Claude Code has 6 permission modes that control how tool calls are approved. The hook receives the current mode in each event and can skip its custom logic for modes you trust, letting Claude Code's built-in permission system handle them instead.
+
+| Mode | UI Name | What runs without asking |
+|---|---|---|
+| `default` | Ask before edits | Reads only |
+| `acceptEdits` | Edit automatically | Reads, file edits, common filesystem commands |
+| `plan` | Plan mode | Reads only (no source edits) |
+| `auto` | Auto mode | Everything (with built-in classifier safety checks) |
+| `dontAsk` | — | Only pre-approved tools via `permissions.allow` rules |
+| `bypassPermissions` | Bypass permissions | Everything (no checks) |
+
+Configure which modes activate the hook in `config.json`:
+
+```json
+{
+  "enabled_modes": ["default", "acceptEdits", "plan"]
+}
+```
+
+When the current mode is **not** in `enabled_modes`, the hook exits immediately with no output, and Claude Code's built-in permission system takes over. This avoids redundant LLM API calls in modes that already have their own safety mechanisms (e.g., `auto` mode's classifier).
+
+If `enabled_modes` is omitted or empty, the hook runs in **all modes** (backward compatible).
+
 ## MCP Tool Allowlist
 
-MCP tools are blocked by default. Add trusted tools in `~/.claude/permission_gate.json`:
+MCP tools are blocked by default. Add trusted tools in `~/.claude/hooks/config.json`:
 
 ```json
 {
