@@ -6,7 +6,7 @@ A PreToolUse hook for Claude Code that classifies tool calls and decides whether
 
 1. **Deterministic allowlist** — Safe operations (internal tools, read-only built-in tools, git status/diff/log, uv/pip/npm package management, linting, type checking, read-only shell commands, etc.) are allowed immediately with no latency.
 2. **LLM fallback** — For uncertain cases (edits, writes, agents, unknown tools, ambiguous bash commands), the hook sends a compact summary including recent user messages to a configured model (`claude-haiku-4-5` by default) for classification.
-3. **No silent deny** — Dangerous actions become "ask" rather than "deny" by default. Explicit deny can be enabled with `CLAUDE_GATE_ENABLE_DENY=1`.
+3. **No silent deny** — Dangerous actions become "ask" rather than "deny" by default. Explicit deny can be enabled with `PERMISSION_GATE_ENABLE_DENY=1`.
 
 ## Quick Start
 
@@ -41,15 +41,15 @@ Then configure Claude Code (`~/.claude/settings.json`) to use the hook:
 
 | Variable | Description | Default |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | API key for LLM fallback decisions | (required for LLM fallback) |
-| `ANTHROPIC_BASE_URL` | Custom Anthropic-compatible API endpoint | `https://api.anthropic.com` |
-| `CLAUDE_GATE_MODEL` | Model for fallback classification | `claude-haiku-4-5` |
-| `CLAUDE_GATE_CONFIG` | Path to JSON config file for MCP allowlists | `~/.claude/hooks/config.json` |
-| `CLAUDE_GATE_ALLOWED_MCP_TOOLS` | Comma-separated extra MCP tool names to allow | (none) |
-| `CLAUDE_GATE_ALLOWED_MCP_PATTERNS` | Comma-separated extra MCP regex patterns to allow | (none) |
-| `CLAUDE_GATE_LOG` | Path for debug logs | (disabled if empty) |
-| `CLAUDE_GATE_ENABLE_DENY` | Set to `1` to honor model-produced deny | `0` |
-| `CLAUDE_GATE_LLM_TIMEOUT` | API timeout in seconds | `20` |
+| `PERMISSION_GATE_LLM_API_KEY` | API key for LLM fallback decisions | (required for LLM fallback) |
+| `PERMISSION_GATE_LLM_BASE_URL` | Custom Anthropic-compatible API endpoint | `https://api.anthropic.com` |
+| `PERMISSION_GATE_MODEL` | Model for fallback classification | `claude-haiku-4-5` |
+| `PERMISSION_GATE_CONFIG` | Path to JSON config file for MCP allowlists | `~/.claude/hooks/config.json` |
+| `PERMISSION_GATE_ALLOWED_MCP_TOOLS` | Comma-separated extra MCP tool names to allow | (none) |
+| `PERMISSION_GATE_ALLOWED_MCP_PATTERNS` | Comma-separated extra MCP regex patterns to allow | (none) |
+| `PERMISSION_GATE_LOG` | Path for debug logs | (disabled if empty) |
+| `PERMISSION_GATE_ENABLE_DENY` | Set to `1` to honor model-produced deny | `0` |
+| `PERMISSION_GATE_LLM_TIMEOUT` | API timeout in seconds | `20` |
 
 ## What's Allowed by Default
 
@@ -117,8 +117,8 @@ MCP tools are blocked by default. Add trusted tools in `~/.claude/hooks/config.j
 
 You can also add tools via environment variables:
 ```bash
-export CLAUDE_GATE_ALLOWED_MCP_TOOLS="mcp__context7__resolve-library-id"
-export CLAUDE_GATE_ALLOWED_MCP_PATTERNS="^mcp__context7__.*$,^mcp__serper-search.*$"
+export PERMISSION_GATE_ALLOWED_MCP_TOOLS="mcp__context7__resolve-library-id"
+export PERMISSION_GATE_ALLOWED_MCP_PATTERNS="^mcp__context7__.*$,^mcp__serper-search.*$"
 ```
 
 MCP tools not in the allowlist fall through to LLM classification rather than being denied outright.
@@ -143,7 +143,7 @@ uv run python test_permission_gate.py
 # Parse and normalization tests only (no API key needed)
 uv run python test_permission_gate.py --parse-only
 
-# LLM integration tests only (requires ANTHROPIC_API_KEY)
+# LLM integration tests only (requires PERMISSION_GATE_LLM_API_KEY)
 uv run python test_permission_gate.py --llm-only
 
 # Show raw API responses

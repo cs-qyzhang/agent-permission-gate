@@ -15,12 +15,12 @@ Policy:
 - Avoid direct deny by default. Dangerous or uncertain actions become ask.
 
 Environment (can also be set via .env file in the script's directory):
-- ANTHROPIC_API_KEY: required only for LLM fallback.
-- ANTHROPIC_BASE_URL: optional base URL for custom Anthropic-compatible API.
-- CLAUDE_GATE_MODEL: model for fallback; default: claude-haiku-4-5.
-- CLAUDE_GATE_CONFIG: optional config JSON path.
-- CLAUDE_GATE_ENABLE_DENY: set to "1" if you want model-produced deny to be honored.
-- CLAUDE_GATE_LLM_TIMEOUT: API timeout seconds; default: 20.
+- PERMISSION_GATE_LLM_API_KEY: required only for LLM fallback.
+- PERMISSION_GATE_LLM_BASE_URL: optional base URL for custom Anthropic-compatible API.
+- PERMISSION_GATE_MODEL: model for fallback; default: claude-haiku-4-5.
+- PERMISSION_GATE_CONFIG: optional config JSON path.
+- PERMISSION_GATE_ENABLE_DENY: set to "1" if you want model-produced deny to be honored.
+- PERMISSION_GATE_LLM_TIMEOUT: API timeout seconds; default: 20.
 """
 
 from __future__ import annotations
@@ -70,13 +70,13 @@ _load_dotenv()
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
 
-MODEL = os.environ.get("CLAUDE_GATE_MODEL", "claude-haiku-4-5")
-BASE_URL = os.environ.get("ANTHROPIC_BASE_URL") or None
-LLM_TIMEOUT = float(os.environ.get("CLAUDE_GATE_LLM_TIMEOUT", "20"))
-ENABLE_DENY = os.environ.get("CLAUDE_GATE_ENABLE_DENY", "0") == "1"
+MODEL = os.environ.get("PERMISSION_GATE_MODEL", "claude-haiku-4-5")
+BASE_URL = os.environ.get("PERMISSION_GATE_LLM_BASE_URL") or None
+LLM_TIMEOUT = float(os.environ.get("PERMISSION_GATE_LLM_TIMEOUT", "20"))
+ENABLE_DENY = os.environ.get("PERMISSION_GATE_ENABLE_DENY", "0") == "1"
 
 # Keep stdout clean: Claude Code expects JSON decision output on stdout.
-LOG_PATH = os.path.expanduser(os.environ.get("CLAUDE_GATE_LOG", ""))
+LOG_PATH = os.path.expanduser(os.environ.get("PERMISSION_GATE_LOG", ""))
 
 
 DEFAULT_ALLOWED_MCP_TOOLS = {
@@ -127,6 +127,7 @@ INTERNAL_TOOLS = {
 }
 
 
+# Broad patterns used for Bash commands and other potentially risky tools.
 SENSITIVE_PATTERNS = [
     r"(^|/)\.env(\.|$|/)",
     r"(^|/)\.ssh($|/)",
@@ -143,6 +144,40 @@ SENSITIVE_PATTERNS = [
     r"api[_-]?key",
     r"access[_-]?token",
     r"refresh[_-]?token",
+]
+
+# Precise patterns for Read/Glob/Grep/LS: only match paths that actually contain secrets.
+_READ_SECRET_PATH_PATTERNS = [
+    # Env files (actual, not examples like .env.example)
+    r"(^|/)\.env$",
+    r"(^|/)\.env\.(local|production|development|test|staging|ci|qa)$",
+    r"(^|/)\.envrc$",
+    # SSH
+    r"(^|/)\.ssh($|/)",
+    r"(^|/)id_rsa($|[.\s])",
+    r"(^|/)id_ed25519($|[.\s])",
+    r"(^|/)id_dsa($|[.\s])",
+    r"(^|/)id_ecdsa($|[.\s])",
+    # Cloud credentials
+    r"(^|/)\.aws($|/)",
+    r"(^|/)google[_-]?application[_-]?credentials",
+    # Config files with possible tokens
+    r"(^|/)\.npmrc$",
+    r"(^|/)\.pypirc$",
+    r"(^|/)\.netrc$",
+    r"(^|/)\.config/gh($|/)",
+    r"(^|/)\.docker/config\.json$",
+    r"(^|/)\.kube/config$",
+    # Named secrets/credentials files (must have known extension)
+    r"(^|/)secrets\.(ya?ml|json|toml)$",
+    r"(^|/)credentials\.(ya?ml|json|toml)$",
+    # Key/token files
+    r"\.pem$",
+    r"(^|/)private[_-]?key[^/]*$",
+    r"(^|/)token\.json$",
+    r"(^|/)access_token",
+    r"(^|/)refresh_token",
+    r"(^|/)\.vault-token$",
 ]
 
 
@@ -230,16 +265,16 @@ def split_env_list(name: str) -> List[str]:
 
 
 def load_config() -> Dict[str, Any]:
-    config_path = Path(os.environ.get("CLAUDE_GATE_CONFIG") or DEFAULT_CONFIG_PATH)
+    config_path = Path(os.environ.get("PERMISSION_GATE_CONFIG") or DEFAULT_CONFIG_PATH)
     config = load_json_file(config_path)
 
     allowed_mcp_tools = set(DEFAULT_ALLOWED_MCP_TOOLS)
     allowed_mcp_tools.update(config.get("allowed_mcp_tools", []))
-    allowed_mcp_tools.update(split_env_list("CLAUDE_GATE_ALLOWED_MCP_TOOLS"))
+    allowed_mcp_tools.update(split_env_list("PERMISSION_GATE_ALLOWED_MCP_TOOLS"))
 
     allowed_mcp_patterns = list(DEFAULT_ALLOWED_MCP_PATTERNS)
     allowed_mcp_patterns.extend(config.get("allowed_mcp_patterns", []))
-    allowed_mcp_patterns.extend(split_env_list("CLAUDE_GATE_ALLOWED_MCP_PATTERNS"))
+    allowed_mcp_patterns.extend(split_env_list("PERMISSION_GATE_ALLOWED_MCP_PATTERNS"))
 
     all_modes = ["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"]
     enabled_modes = set(config.get("enabled_modes", all_modes))
@@ -264,6 +299,11 @@ def json_text(obj: Any) -> str:
 
 def contains_sensitive_reference(text: str) -> bool:
     return any(re.search(pattern, text, re.IGNORECASE) for pattern in SENSITIVE_PATTERNS)
+
+
+def is_read_secret_path(text: str) -> bool:
+    """Check if a path targets an actual secret file (for Read/Glob/Grep/LS tools)."""
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in _READ_SECRET_PATH_PATTERNS)
 
 
 def has_shell_control_operator(command: str) -> bool:
@@ -308,6 +348,20 @@ def mcp_allowed(tool_name: str, config: Dict[str, Any]) -> bool:
 # Built-in tool classifiers
 # ---------------------------------------------------------------------------
 
+def _extract_string_values(obj: Any) -> List[str]:
+    """Recursively extract all string values from a nested dict/list."""
+    result: List[str] = []
+    if isinstance(obj, str):
+        result.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            result.extend(_extract_string_values(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            result.extend(_extract_string_values(item))
+    return result
+
+
 def classify_builtin_read_tool(tool_name: str, tool_input: Dict[str, Any]) -> Tuple[Optional[str], str]:
     """
     Return:
@@ -316,11 +370,11 @@ def classify_builtin_read_tool(tool_name: str, tool_input: Dict[str, Any]) -> Tu
     if tool_name not in READ_ONLY_BUILTIN_TOOLS:
         return None, "Not a read-only built-in tool."
 
-    payload = json_text(tool_input)
-    if contains_sensitive_reference(payload):
-        return None, "Read-like tool references a potentially sensitive path or token."
+    paths = _extract_string_values(tool_input)
+    if any(is_read_secret_path(p) for p in paths):
+        return None, "Read-like tool targets a path that may contain secrets."
 
-    return "allow", f"{tool_name} is a read-only built-in tool and input looks non-sensitive."
+    return "allow", f"{tool_name} is a read-only built-in tool targeting non-secret paths."
 
 
 # ---------------------------------------------------------------------------
@@ -673,10 +727,11 @@ Ask for anything destructive, sensitive, external, privileged, network-uploading
 Return {"decision":"allow",...} only for clearly safe operations such as:
 
 ### File operations
-- Read/list/search non-sensitive files inside the working directory.
+- Read/list/search non-sensitive files inside the working directory — always allow.
 - Edit or write files inside the working directory for the current task.
 - Access files under /tmp.
 - Create temporary/cache/build artifacts inside the working directory.
+- Read/list/search files whose paths happen to contain words like "secret", "key", "token", or "credential" in the filename or directory name is ALLOWED, unless the file itself is a known secret file (e.g., .env, id_rsa, .aws/credentials, secrets.json).
 
 ### Local development commands
 - Read-only validation: tests, lint, type-check, formatting checks, static analysis.
@@ -710,7 +765,7 @@ Return {"decision":"ask",...} for any operation matching one or more of these ca
 - Any operation involving symlinks where the target may be outside the working directory.
 
 ### Sensitive data
-- Access, print, copy, upload, edit, or list secrets, credentials, tokens, private keys, SSH keys, API keys, password stores, browser cookies, or .env files.
+- Access, print, copy, upload, edit, or list actual secret files: .env, .env.local, .env.production, id_rsa, id_ed25519, .ssh/*, .aws/*, .npmrc, .pypirc, .netrc, secrets.json, credentials.json, .docker/config.json, .kube/config, and other files specifically known to store real secrets or tokens.
 - Commands that may expose environment variables containing secrets.
 
 ### Git state-changing commands
@@ -741,8 +796,14 @@ Return {"decision":"ask",...} for any operation matching one or more of these ca
 - Any command using obfuscation, shell eval, encoded scripts, dynamic command construction, or downloading and executing code.
 - Any operation that combines a safe command with a risky redirection, pipe, subshell, or side effect.
 
+## USER INTENT CONSIDERATION
+When user messages explicitly request or instruct an action, and the tool call directly fulfills that instruction, factor this into your decision:
+- If the user's message clearly authorizes a specific action (e.g., "run the tests", "install this package", "edit this file", "commit the changes"), and the tool call is performing exactly that action, prefer "allow" unless the action is highly destructive.
+- This applies even for commands that would normally require caution — if the user explicitly asked for it and the tool is just executing their stated intent, that is strong evidence the action is expected and consensual.
+- Still "ask" if the action is irrevocably destructive (rm -rf, force push, sudo, production deploy), accesses secrets, or affects systems outside the working directory — even if the user requested it.
+- If the tool call is unrelated to or contradicts the user's recent instructions, do not use this guidance — fall back to standard classification.
+
 ## CLASSIFICATION NOTES
-- Classify the actual tool use, not the user's stated intent.
 - Prefer "ask" when a command has both safe and risky parts.
 - A command being common does not make it safe.
 - A path being relative is safe only if it stays inside the working directory.
@@ -775,7 +836,13 @@ Input: Bash command="git reset --hard HEAD~1"
 Output: {"decision":"ask","reason":"Git reset can destructively change repository state."}
 
 Input: Bash command="cat .env"
-Output: {"decision":"ask","reason":"Accessing .env may expose secrets."}
+Output: {"decision":"ask","reason":".env is a known secret file."}
+
+Input: Bash command="cat docs/secrets.md"
+Output: {"decision":"allow","reason":"Markdown documentation file, not a known secret file."}
+
+Input: Read file_path="/data/llm/Qwen3-8B/config.json"
+Output: {"decision":"allow","reason":"Model configuration file, not a known secret file."}
 
 Input: Bash command="npm test"
 Output: {"decision":"allow","reason":"Project-local test command is routine validation."}
@@ -797,6 +864,15 @@ Output: {"decision":"allow","reason":"Code review subagent is a standard develop
 
 Input: Agent tool_name="Agent" description="Delete production database" subagent_type="general-purpose"
 Output: {"decision":"ask","reason":"Subagent requests destructive operation on production system."}
+
+Input: Bash command="git commit -m 'fix bug'" (user said "commit the fix for me")
+Output: {"decision":"allow","reason":"User explicitly requested git commit action."}
+
+Input: Bash command="npm install lodash" (user said "add lodash dependency")
+Output: {"decision":"allow","reason":"User explicitly requested package installation."}
+
+Input: Bash command="git push --force" (user said "push my changes")
+Output: {"decision":"ask","reason":"Force push is irrevocably destructive even when user requested push."}
 """
 
 
@@ -950,9 +1026,9 @@ def extract_user_inputs(event: Dict[str, Any]) -> Tuple[Optional[Tuple[int, str]
 
 
 def llm_decide(event: Dict[str, Any], preliminary_reason: str) -> Tuple[str, str]:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("PERMISSION_GATE_LLM_API_KEY")
     if not api_key:
-        return "ask", "No ANTHROPIC_API_KEY configured for LLM fallback."
+        return "ask", "No PERMISSION_GATE_LLM_API_KEY configured for LLM fallback."
 
     try:
         from anthropic import Anthropic
@@ -995,7 +1071,16 @@ def llm_decide(event: Dict[str, Any], preliminary_reason: str) -> Tuple[str, str
     log_debug(f"[LLM] user prompt:\n{prompt}")
 
     try:
-        client = Anthropic(api_key=api_key, base_url=BASE_URL, timeout=LLM_TIMEOUT, max_retries=0)
+        # The Anthropic SDK auto-reads ANTHROPIC_AUTH_TOKEN from the environment
+        # even when api_key is passed explicitly.  Third-party Anthropic-compatible
+        # endpoints (e.g. DeepSeek) reject this token, so we must remove it before
+        # constructing the client.
+        saved_auth_token = os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+        try:
+            client = Anthropic(api_key=api_key, base_url=BASE_URL, timeout=LLM_TIMEOUT, max_retries=0)
+        finally:
+            if saved_auth_token is not None:
+                os.environ["ANTHROPIC_AUTH_TOKEN"] = saved_auth_token
 
         response = client.messages.create(
             model=MODEL,
@@ -1026,6 +1111,8 @@ def llm_decide(event: Dict[str, Any], preliminary_reason: str) -> Tuple[str, str
         return decision, reason
 
     except Exception as e:
+        if "timeout" in type(e).__name__.lower() or "timeout" in str(e).lower():
+            log_debug(f"[LLM] Request timed out after {LLM_TIMEOUT}s: {type(e).__name__}: {e}")
         return "ask", f"LLM fallback failed: {type(e).__name__}: {e}"
 
 

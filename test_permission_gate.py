@@ -218,16 +218,16 @@ def build_prompt(scenario: Dict[str, Any]) -> str:
 
 
 def test_llm_integration() -> bool:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("PERMISSION_GATE_LLM_API_KEY")
     if not api_key:
-        print("\nSKIP LLM tests: ANTHROPIC_API_KEY not set.")
+        print("\nSKIP LLM tests: PERMISSION_GATE_LLM_API_KEY not set.")
         return True
 
     from anthropic import Anthropic
 
-    model = os.environ.get("CLAUDE_GATE_MODEL", "claude-haiku-4-5-20251001")
-    base_url = os.environ.get("ANTHROPIC_BASE_URL") or None
-    timeout = float(os.environ.get("CLAUDE_GATE_LLM_TIMEOUT", "30"))
+    model = os.environ.get("PERMISSION_GATE_MODEL", "claude-haiku-4-5")
+    base_url = os.environ.get("PERMISSION_GATE_LLM_BASE_URL") or None
+    timeout = float(os.environ.get("PERMISSION_GATE_LLM_TIMEOUT", "30"))
 
     client = Anthropic(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0)
 
