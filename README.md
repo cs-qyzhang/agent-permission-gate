@@ -92,17 +92,26 @@ Claude Code has 6 permission modes that control how tool calls are approved. The
 | `dontAsk` | — | Only pre-approved tools via `permissions.allow` rules |
 | `bypassPermissions` | Bypass permissions | Everything (no checks) |
 
-Configure which modes activate the hook in `config.json`:
+The hook supports two policy tiers, configured in `config.json`:
+
+- **`normal_modes`**: The hook applies its standard allowlist — allows safe development operations (editing, testing, package installs, etc.).
+- **`readonly_modes`**: The hook applies a stricter read-only policy — only read/analysis operations, no file modification or package installs.
+
+Both activate the hook; the difference is the policy level. Modes not in either list fall through to Claude Code's built-in permission system — each mode's default behavior (e.g. `default` mode auto-allows reads, `acceptEdits` auto-allows reads and edits) applies without the hook's intervention.
 
 ```json
 {
-  "enabled_modes": ["default", "acceptEdits", "plan"]
+  "normal_modes": ["auto", "acceptEdits", "dontAsk"],
+  "readonly_modes": ["plan", "default"]
 }
 ```
 
-When the current mode is **not** in `enabled_modes`, the hook exits immediately with no output, and Claude Code's built-in permission system takes over. This avoids redundant LLM API calls in modes that already have their own safety mechanisms (e.g., `auto` mode's classifier).
+When the current mode is in `readonly_modes`:
 
-If `enabled_modes` is omitted or empty, the hook runs in **all modes** (backward compatible).
+- **Write/Edit/NotebookEdit** tools are always "ask" — file modification is not allowed.
+- **Bash** only allows truly read-only commands: `ls`, `cat`, `grep`, `find` (without `-delete`/`-exec`), `git status`/`diff`/`log`, etc. Package managers (`uv sync`, `npm install`), test runners (`pytest`), and code execution are NOT allowed.
+- **WebSearch/WebFetch** are still allowed (read-only network access).
+- **LLM fallback** uses a stricter system prompt (`LLM_READONLY_SYSTEM_PROMPT`) that prioritizes read-only safety — even commonly safe commands like `pytest` or `uv sync` will be rejected.
 
 ## MCP Tool Allowlist
 
