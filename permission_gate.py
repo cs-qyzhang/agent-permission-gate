@@ -1011,6 +1011,8 @@ Return {"decision":"allow",...} ONLY for clearly read-only, non-sensitive operat
 - find (without -delete, -exec, -execdir, -ok, -okdir).
 - grep, rg, fd (search tools).
 - pwd, date, whoami, uname, hostname, which, command, type.
+- Shell control operators such as pipes (`|`), semicolons (`;`), `&&`, `||`, command grouping, output limiting commands like `head`, and stderr redirection to `/dev/null` do not by themselves require "ask". Evaluate the command compositionally: if every subcommand is inspectable and read-only, and the overall command only searches, filters, limits, or prints information without changing files, environment, processes, network state, or other persistent state, return "allow". Otherwise return "ask".
+- Commands that use `find`, `grep`, `head`, `cat`, `sed -n`, `awk` for filtering/printing, or `python -c` for import/path inspection may be "allow" when they only read file metadata or file contents and print results. Redirections like `2>/dev/null` are allowed when used only to suppress errors. If the command includes write redirection to real files, deletion, chmod/chown, package installation, network access, process control, or other persistent changes, return "ask".
 
 ### Network read-only
 - WebSearch and WebFetch tools (built-in read-only search/fetch).
@@ -1125,6 +1127,15 @@ Output: {"decision":"ask","reason":"The code writes to a file, which changes fil
 
 Input: Bash command="python -c \"import os; os.remove('data.csv')\""
 Output: {"decision":"ask","reason":"The code deletes a file, which changes file-system state."}
+
+Input: Bash command="grep -n \"moe\\|offload\\|MoE\\|CPU\" /home/user/project/README.md 2>/dev/null | head -30"
+Output: {"decision":"allow","reason":"The command only reads a README file and does not modify files or persistent state."}
+
+Input: Bash command="find /home/user/.cache -path \"*/accelerate/hooks.py\" 2>/dev/null | head -5; find /home/user -path \"*/accelerate/hooks.py\" -not -path \"*/.cache/*\" 2>/dev/null | head -5; uv run python -c \"import accelerate.hooks; print(accelerate.hooks.__file__)\" 2>/dev/null"
+Output: {"decision":"allow","reason":"The command only searches for matching file paths and runs inspectable Python code."}
+
+Input: Bash command="find /home/user/.cache -path \"*/accelerate/hooks.py\" -delete; python -c \"open('log.txt','w').write('done')\""
+Output: {"decision":"ask","reason":"The command deletes files and writes to a real file, which modifies file-system state."}
 
 Input: Read file_path="/home/user/project/README.md"
 Output: {"decision":"allow","reason":"Reading a non-secret project file."}
@@ -1430,8 +1441,15 @@ def decide(event: Dict[str, Any], config: Dict[str, Any], readonly: bool = False
             return "allow", f"MCP tool {tool_name} is in the allowlist."
         return llm_decide(event, f"MCP tool {tool_name} is not in the deterministic allowlist.", readonly=readonly)
 
-    # 4. Write/Edit/NotebookEdit in readonly mode: always ask.
+    # 4. Write/Edit/NotebookEdit in readonly mode: always ask, with one exception:
+    #    plan mode is allowed to write .md files under ~/.claude/plan.
     if readonly and tool_name in {"Write", "Edit", "NotebookEdit"}:
+        if event.get("permission_mode") == "plan":
+            file_path = str(tool_input.get("file_path", ""))
+            plan_dir = os.path.expanduser("~/.claude/plan")
+            expanded = os.path.abspath(os.path.expanduser(file_path)) if file_path else ""
+            if expanded.startswith(plan_dir + os.sep) and expanded.endswith(".md"):
+                return "allow", f"{tool_name} to plan .md file is allowed in plan read-only mode."
         return "ask", f"{tool_name} modifies files, not allowed in read-only mode."
 
     # 5. Read-only built-in tools.
