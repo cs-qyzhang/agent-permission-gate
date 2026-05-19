@@ -143,6 +143,34 @@ When a tool call doesn't match any deterministic rule, the hook sends a compact 
 
 The LLM is instructed with a detailed system prompt covering allow/ask policies for file operations, git commands, network requests, privileged operations, and Agent/subagent tool use. The model classifies subagent (Agent tool) requests based on the task description — code exploration, review, debugging, and standard development tasks are allowed; destructive or sensitive operations are escalated to "ask".
 
+## Status Line
+
+`statusline-command.sh` displays real-time info in Claude Code's status bar: current model, working directory, git branch, and context window remaining percentage.
+
+Example output:
+
+```
+deepseek-v4-pro[1m] | claude-code-permission-gate | main | context left: 85%
+```
+
+### Configuration
+
+Add a `statusLine` entry to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "bash ~/.claude/hooks/statusline-command.sh"
+  }
+}
+```
+
+### Dependencies
+
+- `jq` is recommended for JSON parsing
+- Falls back to `python3` (bundled with most systems)
+
 ## Testing
 
 ```bash
