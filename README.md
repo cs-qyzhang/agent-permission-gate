@@ -26,9 +26,21 @@ Then configure Claude Code (`~/.claude/settings.json`) to use the hook:
         "hooks": [
           {
             "type": "command",
-            "command": "uv run --script ~/.claude/hooks/permission_gate.py",
+            "command": "uv run --script ~/.claude/claude-code-permission-gate/permission_gate.py",
             "timeout": 20,
             "statusMessage": "Checking tool permission"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --script ~/.claude/claude-code-permission-gate/permission_gate.py",
+            "timeout": 10
           }
         ]
       }
@@ -36,6 +48,8 @@ Then configure Claude Code (`~/.claude/settings.json`) to use the hook:
   }
 }
 ```
+
+The PostToolUse hook is optional but recommended — it enables the **user override memory** feature (see below).
 
 ## Configuration (via `.env`)
 
@@ -143,6 +157,33 @@ When a tool call doesn't match any deterministic rule, the hook sends a compact 
 
 The LLM is instructed with a detailed system prompt covering allow/ask policies for file operations, git commands, network requests, privileged operations, and Agent/subagent tool use. The model classifies subagent (Agent tool) requests based on the task description — code exploration, review, debugging, and standard development tasks are allowed; destructive or sensitive operations are escalated to "ask".
 
+## User Override Memory
+
+When the PostToolUse hook is configured, the permission gate tracks cases where the LLM classified a tool as "ask" but the user chose to execute it anyway. This history is stored per-session in a SQLite database (`~/.claude/hooks/permission_gate_memory.db` by default).
+
+On subsequent LLM fallbacks, the **5 most recent overrides** for the current session are injected into the classification prompt, helping the LLM calibrate its decision threshold to the user's actual preferences.
+
+### How it works
+
+1. **PreToolUse**: LLM decides "ask" → a pending entry is recorded in the DB.
+2. **PostToolUse**: The tool executes (user approved) → the pending entry is confirmed as a user override.
+3. **Next LLM fallback**: The recent overrides are included in the prompt:
+   ```
+   ## Recent user overrides in this session
+   Below are recent cases where the LLM classified a tool as "ask"
+   but the user chose to execute it...
+   1. Bash: npm install lodash
+   2. Edit: file_path: /home/user/project/src/config.py
+   ```
+
+If the user denies a tool (no PostToolUse fires), the stale pending entry is cleaned up on the next PreToolUse invocation.
+
+### Configuration
+
+| Variable | Description | Default |
+|---|---|---|
+| `PERMISSION_GATE_MEMORY_DB` | Path to the SQLite memory database | `~/.claude/hooks/permission_gate_memory.db` |
+
 ## Status Line
 
 `statusline-command.sh` displays real-time info in Claude Code's status bar: current model, working directory, git branch, and context window remaining percentage.
@@ -161,7 +202,7 @@ Add a `statusLine` entry to `~/.claude/settings.json`:
 {
   "statusLine": {
     "type": "command",
-    "command": "bash ~/.claude/hooks/statusline-command.sh"
+    "command": "bash ~/.claude/claude-code-permission-gate/statusline-command.sh"
   }
 }
 ```

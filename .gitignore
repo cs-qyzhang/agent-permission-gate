@@ -4,6 +4,11 @@
 # Logs
 permission.log
 
+# Permission gate memory database
+permission_gate_memory.db
+permission_gate_memory.db-wal
+permission_gate_memory.db-shm
+
 # Python
 __pycache__/
 *.pyc

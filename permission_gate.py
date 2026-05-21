@@ -29,7 +29,9 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -78,21 +80,12 @@ ENABLE_DENY = os.environ.get("PERMISSION_GATE_ENABLE_DENY", "0") == "1"
 # Keep stdout clean: Claude Code expects JSON decision output on stdout.
 LOG_PATH = os.path.expanduser(os.environ.get("PERMISSION_GATE_LOG", ""))
 
-
-DEFAULT_ALLOWED_MCP_TOOLS = {
-    # Fill in exact MCP tool names you trust, for example:
-    # "mcp__context7__resolve-library-id",
-    # "mcp__context7__get-library-docs",
-    # "mcp__sequential-thinking__sequentialthinking",
-}
-
-DEFAULT_ALLOWED_MCP_PATTERNS = [
-    # Regex patterns. Keep these conservative.
-    #
-    # Examples:
-    # r"^mcp__context7__.*$",
-    # r"^mcp__sequential-thinking__.*$",
-]
+# SQLite memory for tracking LLM-ask → user-executed overrides per session.
+MEMORY_DB_PATH = os.path.expanduser(
+    os.environ.get("PERMISSION_GATE_MEMORY_DB",
+                   str(SCRIPT_DIR / "permission_gate_memory.db"))
+)
+MAX_OVERRIDES = 5  # Max user-override records kept per session.
 
 
 WEB_TOOLS = {
@@ -237,10 +230,189 @@ def log_debug(message: str) -> None:
 
 def log_separator() -> None:
     """Write a timestamped separator line to the log at each invocation."""
-    from datetime import datetime
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sep = "-" * 40
     log_debug(f"\n{sep} [{ts}] {sep}")
+
+
+# ---------------------------------------------------------------------------
+# SQLite memory for tracking per-session LLM-ask → user-executed overrides
+# ---------------------------------------------------------------------------
+
+def _get_memory_db() -> sqlite3.Connection:
+    """Get a cached SQLite connection with WAL mode and busy timeout."""
+    global _memory_db_conn
+    if _memory_db_conn is None:
+        _memory_db_conn = sqlite3.connect(MEMORY_DB_PATH, timeout=5)
+        _memory_db_conn.execute("PRAGMA journal_mode=WAL")
+        _memory_db_conn.execute("PRAGMA busy_timeout=3000")
+        _memory_db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_asks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_input_summary TEXT NOT NULL,
+                permission_mode TEXT NOT NULL DEFAULT 'default',
+                created_at TEXT NOT NULL
+            )
+        """)
+        _memory_db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_overrides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_input_summary TEXT NOT NULL,
+                permission_mode TEXT NOT NULL DEFAULT 'default',
+                created_at TEXT NOT NULL
+            )
+        """)
+        # Migration: add permission_mode column to tables created before this feature.
+        for table in ("pending_asks", "user_overrides"):
+            try:
+                _memory_db_conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'default'"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        _memory_db_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_session
+            ON pending_asks(session_id)
+        """)
+        _memory_db_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_overrides_session
+            ON user_overrides(session_id, permission_mode, created_at DESC)
+        """)
+        _memory_db_conn.commit()
+    return _memory_db_conn
+
+
+_memory_db_conn: Optional[sqlite3.Connection] = None
+
+
+def _make_tool_summary(tool_name: str, tool_input: Dict[str, Any]) -> str:
+    """Create a concise, stable summary of tool_input for matching and display."""
+    if not isinstance(tool_input, dict):
+        return str(tool_input)[:300]
+    if tool_name == "Bash":
+        return str(tool_input.get("command", ""))[:300]
+    if tool_name in ("Write", "Edit", "NotebookEdit"):
+        return f"file_path: {tool_input.get('file_path', '')}"[:300]
+    if tool_name == "Agent":
+        parts = []
+        desc = tool_input.get("description", "")
+        if desc:
+            parts.append(f"description: {desc}")
+        st = tool_input.get("subagent_type", "")
+        if st:
+            parts.append(f"subagent_type: {st}")
+        return ", ".join(parts)[:300]
+    # Generic: include all keys except verbose fields
+    skip_keys = {"content", "old_string", "new_string"}
+    parts = []
+    for k in sorted(tool_input.keys()):
+        v = tool_input[k]
+        if k in skip_keys:
+            parts.append(f"{k}: <{len(str(v))} chars>")
+        else:
+            parts.append(f"{k}: {str(v)[:100]}")
+    return ", ".join(parts)[:300]
+
+
+def _record_pending_ask(session_id: str, tool_name: str, tool_input: Dict[str, Any],
+                       permission_mode: str = "default") -> None:
+    """Record that LLM decided 'ask' for this tool call (pending user decision)."""
+    if not session_id:
+        return
+    try:
+        db = _get_memory_db()
+        summary = _make_tool_summary(tool_name, tool_input)
+        now = datetime.now(timezone.utc).isoformat()
+        # One pending ask per session at a time.
+        db.execute("DELETE FROM pending_asks WHERE session_id = ?", (session_id,))
+        db.execute(
+            "INSERT INTO pending_asks (session_id, tool_name, tool_input_summary, "
+            "permission_mode, created_at) VALUES (?, ?, ?, ?, ?)",
+            (session_id, tool_name, summary, permission_mode, now),
+        )
+        db.commit()
+        log_debug(f"[MEMORY] Recorded pending ask [{permission_mode}]: {tool_name} | {summary[:80]}")
+    except Exception as e:
+        log_debug(f"[MEMORY] Failed to record pending ask: {e}")
+
+
+def _confirm_override(session_id: str, tool_name: str, tool_input: Dict[str, Any]) -> None:
+    """Move a pending ask to user_overrides when the user chose to execute."""
+    if not session_id:
+        return
+    try:
+        db = _get_memory_db()
+        summary = _make_tool_summary(tool_name, tool_input)
+        row = db.execute(
+            "SELECT id, permission_mode FROM pending_asks "
+            "WHERE session_id = ? AND tool_name = ? AND tool_input_summary = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (session_id, tool_name, summary),
+        ).fetchone()
+        if row:
+            pending_id, permission_mode = row
+            now = datetime.now(timezone.utc).isoformat()
+            db.execute("DELETE FROM pending_asks WHERE id = ?", (pending_id,))
+            db.execute(
+                "INSERT INTO user_overrides (session_id, tool_name, tool_input_summary, "
+                "permission_mode, created_at) VALUES (?, ?, ?, ?, ?)",
+                (session_id, tool_name, summary, permission_mode, now),
+            )
+            # Keep only the most recent N overrides per session+mode.
+            db.execute(
+                "DELETE FROM user_overrides WHERE session_id = ? AND permission_mode = ? "
+                "AND id NOT IN ("
+                "  SELECT id FROM user_overrides WHERE session_id = ? AND permission_mode = ? "
+                "  ORDER BY created_at DESC LIMIT ?"
+                ")",
+                (session_id, permission_mode, session_id, permission_mode, MAX_OVERRIDES),
+            )
+            db.commit()
+            log_debug(f"[MEMORY] Confirmed override [{permission_mode}]: {tool_name} | {summary[:80]}")
+        else:
+            log_debug(f"[MEMORY] No pending ask matched for PostToolUse: {tool_name} | {summary[:80]}")
+    except Exception as e:
+        log_debug(f"[MEMORY] Failed to confirm override: {e}")
+
+
+def _get_recent_overrides(session_id: str, permission_mode: str = "default",
+                          limit: int = MAX_OVERRIDES) -> List[Dict[str, str]]:
+    """Get recent user-override records for the given session and permission mode."""
+    if not session_id:
+        return []
+    try:
+        db = _get_memory_db()
+        rows = db.execute(
+            "SELECT tool_name, tool_input_summary FROM user_overrides "
+            "WHERE session_id = ? AND permission_mode = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (session_id, permission_mode, limit),
+        ).fetchall()
+        return [{"tool_name": r[0], "summary": r[1]} for r in rows]
+    except Exception as e:
+        log_debug(f"[MEMORY] Failed to get overrides: {e}")
+        return []
+
+
+def _cleanup_stale_pending(session_id: str, max_age_seconds: int = 300) -> None:
+    """Remove pending asks older than max_age_seconds for the given session."""
+    if not session_id:
+        return
+    try:
+        db = _get_memory_db()
+        cutoff = datetime.now(timezone.utc).timestamp() - max_age_seconds
+        db.execute(
+            "DELETE FROM pending_asks WHERE session_id = ? AND "
+            "CAST(strftime('%s', created_at) AS INTEGER) < ?",
+            (session_id, int(cutoff)),
+        )
+        db.commit()
+    except Exception as e:
+        log_debug(f"[MEMORY] Failed to cleanup stale pending: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -268,11 +440,11 @@ def load_config() -> Dict[str, Any]:
     config_path = Path(os.environ.get("PERMISSION_GATE_CONFIG") or DEFAULT_CONFIG_PATH)
     config = load_json_file(config_path)
 
-    allowed_mcp_tools = set(DEFAULT_ALLOWED_MCP_TOOLS)
+    allowed_mcp_tools = set()
     allowed_mcp_tools.update(config.get("allowed_mcp_tools", []))
     allowed_mcp_tools.update(split_env_list("PERMISSION_GATE_ALLOWED_MCP_TOOLS"))
 
-    allowed_mcp_patterns = list(DEFAULT_ALLOWED_MCP_PATTERNS)
+    allowed_mcp_patterns = list()
     allowed_mcp_patterns.extend(config.get("allowed_mcp_patterns", []))
     allowed_mcp_patterns.extend(split_env_list("PERMISSION_GATE_ALLOWED_MCP_PATTERNS"))
 
@@ -1331,6 +1503,11 @@ def llm_decide(event: Dict[str, Any], preliminary_reason: str, readonly: bool = 
     except Exception as e:
         return "ask", f"Anthropic SDK unavailable: {e}"
 
+    session_id = str(event.get("session_id", ""))
+    tool_name = str(event.get("tool_name", ""))
+    tool_input = event.get("tool_input") or {}
+    permission_mode = str(event.get("permission_mode", "default"))
+
     system_prompt = LLM_READONLY_SYSTEM_PROMPT if readonly else LLM_SYSTEM_PROMPT
     mode_label = "READ-ONLY" if readonly else "NORMAL"
 
@@ -1355,6 +1532,29 @@ def llm_decide(event: Dict[str, Any], preliminary_reason: str, readonly: bool = 
     if event.get("cwd"):
         prompt_parts.append(f"Project working directory: {event['cwd']}\n")
 
+    # Inject recent user overrides for this session (LLM asked, user executed).
+    overrides = _get_recent_overrides(session_id, permission_mode)
+    if overrides:
+        prompt_parts.append("## Recent user overrides in this session\n")
+        prompt_parts.append(
+            f"Below are recent cases (same permission mode: {permission_mode}) where "
+            "the LLM classified a tool as \"ask\" but the user chose to execute it. "
+            "These may help you understand "
+            "what this user considers acceptable, but calibrate with care:\n"
+            "- The same command can carry different risk in different contexts "
+            "(e.g., editing a config file vs deleting a data directory).\n"
+            "- High-risk operations (force push, sudo, rm -rf, chmod, production "
+            "deploys) should still default to \"ask\" even if the user approved "
+            "a similar-looking command earlier — a single mistaken approval does "
+            "not imply a permanent grant.\n"
+            "- Prefer \"allow\" only when the current tool call is comparably "
+            "low-risk AND aligns with the pattern of previously approved operations.\n"
+        )
+        for i, ov in enumerate(overrides, 1):
+            prompt_parts.append(f"{i}. {ov['tool_name']}: {ov['summary']}\n")
+
+    if first_user or recent_users:
+        prompt_parts.append("## User messages\n")
     if first_user:
         turn, msg_text = first_user
         prompt_parts.append(f'<user_message turn="{turn}">\n' + msg_text + "\n</user_message>\n")
@@ -1363,6 +1563,7 @@ def llm_decide(event: Dict[str, Any], preliminary_reason: str, readonly: bool = 
             if first_user and msg_text == first_user[1]:
                 continue
             prompt_parts.append(f'<user_message turn="{turn}">\n' + msg_text + "\n</user_message>\n")
+    prompt_parts.append("## Tool request\n")
     prompt_parts.append("<tool_request>\n" + json.dumps(compact_event, ensure_ascii=False, indent=2)[:12000] + "\n</tool_request>")
     prompt = "\n".join(prompt_parts)
 
@@ -1399,10 +1600,16 @@ def llm_decide(event: Dict[str, Any], preliminary_reason: str, readonly: bool = 
         reason = str(data.get("reason", "LLM fallback decision.")).strip()
 
         if decision == "deny" and not ENABLE_DENY:
-            return "ask", f"LLM suggested deny; downgraded to ask. Reason: {reason}"
+            decision = "ask"
+            reason = f"LLM suggested deny; downgraded to ask. Reason: {reason}"
 
         if decision not in {"allow", "ask", "deny"}:
             return "ask", f"Invalid LLM decision {decision!r}; asking user."
+
+        # When LLM decides "ask", record a pending entry so PostToolUse can
+        # detect whether the user ultimately chose to execute.
+        if decision == "ask":
+            _record_pending_ask(session_id, tool_name, tool_input, permission_mode)
 
         if decision == "deny":
             return "deny", reason
@@ -1472,6 +1679,19 @@ def decide(event: Dict[str, Any], config: Dict[str, Any], readonly: bool = False
     return llm_decide(event, "Tool is not covered by deterministic policy.", readonly=readonly)
 
 
+def handle_post_tool_use(event: Dict[str, Any]) -> None:
+    """Handle PostToolUse hook: confirm pending LLM-asks when user executed."""
+    session_id = str(event.get("session_id", ""))
+    tool_name = str(event.get("tool_name", ""))
+    tool_input = event.get("tool_input") or {}
+
+    log_debug(f"[POST] tool={tool_name} session={session_id[:20]}...")
+
+    if session_id and tool_name:
+        _cleanup_stale_pending(session_id)
+        _confirm_override(session_id, tool_name, tool_input)
+
+
 def main() -> None:
     log_separator()
     try:
@@ -1481,9 +1701,15 @@ def main() -> None:
         ask(f"Could not parse hook input JSON: {e}")
         return
 
-    log_debug(f"[INPUT] {json.dumps(event, ensure_ascii=False)[:8000]}")
+    hook_event = str(event.get("hook_event_name", "PreToolUse"))
+    log_debug(f"[INPUT] hook={hook_event} " + json.dumps(event, ensure_ascii=False)[:8000])
 
-    # Check if the current permission mode is in the enabled list.
+    # PostToolUse: silently confirm pending asks — no output needed.
+    if hook_event == "PostToolUse":
+        handle_post_tool_use(event)
+        sys.exit(0)
+
+    # PreToolUse: normal permission gating.
     config = load_config()
     current_mode = event.get("permission_mode", "default")
     if current_mode not in config["normal_modes"] and current_mode not in config["readonly_modes"]:
