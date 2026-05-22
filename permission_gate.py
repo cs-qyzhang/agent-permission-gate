@@ -1640,14 +1640,14 @@ def decide(event: Dict[str, Any], config: Dict[str, Any], readonly: bool = False
         return llm_decide(event, f"MCP tool {tool_name} is not in the deterministic allowlist.", readonly=readonly)
 
     # 4. Write/Edit/NotebookEdit in readonly mode: always ask, with one exception:
-    #    plan mode is allowed to write .md files under ~/.claude/plan.
+    #    plan mode is allowed to write .md files under ~/.claude/plans.
     if readonly and tool_name in {"Write", "Edit", "NotebookEdit"}:
         if event.get("permission_mode") == "plan":
             file_path = str(tool_input.get("file_path", ""))
-            plan_dir = os.path.expanduser("~/.claude/plan")
+            plan_dir = os.path.expanduser("~/.claude/plans")
             if file_path:
                 # Resolve relative paths against the project cwd from the event,
-                # so paths like "../.claude/plan/xxx.md" (when the project is in
+                # so paths like "../.claude/plans/xxx.md" (when the project is in
                 # the home directory) are correctly resolved and matched.
                 cwd = str(event.get("cwd", os.getcwd()))
                 if not os.path.isabs(file_path):
