@@ -102,6 +102,7 @@ READ_ONLY_BUILTIN_TOOLS = {
 
 # Purely internal tools that never touch the filesystem — always safe to allow.
 INTERNAL_TOOLS = {
+    "Agent",
     "TaskCreate",
     "TaskGet",
     "TaskList",
@@ -1190,10 +1191,6 @@ Return {"decision":"allow",...} ONLY for clearly read-only, non-sensitive operat
 - WebSearch and WebFetch tools (built-in read-only search/fetch).
 - curl/wget commands that only download/read public data and do NOT send request bodies, credentials, files, or local data (no -d, --data, -F, --form, -T, --upload-file, --post-data, -X POST/PUT/PATCH/DELETE).
 
-### Subagent (Agent tool) requests
-- Allow Agent tool use ONLY when the subagent task is purely read-only: code exploration, research, code review, searching, reading files, understanding code structure.
-- Ask if the subagent task may involve writing, editing, installing, building, testing, deploying, or any state-changing operation.
-
 ### Side-effect-free code analysis
 - Linters and static analysis: ruff check (without --fix), mypy, pyright, basedpyright, pyre, pylint, clippy, shellcheck.
 - Formatters in check-only mode: black --check, isort --check-only/--check, ruff format --check, prettier --check.
@@ -1329,12 +1326,6 @@ Output: {"decision":"allow","reason":"Read-only git log command."}
 
 Input: Bash command="git commit -m 'fix'"
 Output: {"decision":"ask","reason":"Git commit modifies repository state."}
-
-Input: Agent tool_name="Agent" description="Find auth logic" subagent_type="Explore"
-Output: {"decision":"allow","reason":"Subagent code exploration is read-only."}
-
-Input: Agent tool_name="Agent" description="Fix the bug in login" subagent_type="general-purpose"
-Output: {"decision":"ask","reason":"Bug fixing subagent may write/edit code."}
 
 Input: WebSearch query="latest Python docs"
 Output: {"decision":"allow","reason":"WebSearch is read-only network search."}
@@ -1654,9 +1645,17 @@ def decide(event: Dict[str, Any], config: Dict[str, Any], readonly: bool = False
         if event.get("permission_mode") == "plan":
             file_path = str(tool_input.get("file_path", ""))
             plan_dir = os.path.expanduser("~/.claude/plan")
-            expanded = os.path.abspath(os.path.expanduser(file_path)) if file_path else ""
-            if expanded.startswith(plan_dir + os.sep) and expanded.endswith(".md"):
-                return "allow", f"{tool_name} to plan .md file is allowed in plan read-only mode."
+            if file_path:
+                # Resolve relative paths against the project cwd from the event,
+                # so paths like "../.claude/plan/xxx.md" (when the project is in
+                # the home directory) are correctly resolved and matched.
+                cwd = str(event.get("cwd", os.getcwd()))
+                if not os.path.isabs(file_path):
+                    expanded = os.path.normpath(os.path.join(cwd, file_path))
+                else:
+                    expanded = os.path.normpath(os.path.expanduser(file_path))
+                if expanded.startswith(plan_dir + os.sep) and expanded.endswith(".md"):
+                    return "allow", f"{tool_name} to plan .md file is allowed in plan read-only mode."
         return "ask", f"{tool_name} modifies files, not allowed in read-only mode."
 
     # 5. Read-only built-in tools.
