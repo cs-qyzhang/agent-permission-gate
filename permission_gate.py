@@ -1584,7 +1584,7 @@ def extract_user_inputs(event: Dict[str, Any]) -> Tuple[Optional[Tuple[int, str]
     return first, recent
 
 
-def llm_decide(event: Dict[str, Any], preliminary_reason: str, readonly: bool = False) -> Tuple[str, str]:
+def llm_decide(event: Dict[str, Any], preliminary_reason: str, readonly: bool = False, permission_mode: str = "default") -> Tuple[str, str]:
     api_key = os.environ.get("PERMISSION_GATE_LLM_API_KEY")
     if not api_key:
         return "ask", "No PERMISSION_GATE_LLM_API_KEY configured for LLM fallback."
@@ -1722,7 +1722,7 @@ def decide(event: Dict[str, Any], config: Dict[str, Any], readonly: bool = False
     tool_input = event.get("tool_input") or {}
 
     if not isinstance(tool_input, dict):
-        return llm_decide(event, "Unexpected tool_input format.", readonly=readonly)
+        return llm_decide(event, "Unexpected tool_input format.", readonly=readonly, permission_mode=permission_mode)
 
     # 1. Internal tools: always allow (no filesystem impact).
     if tool_name in INTERNAL_TOOLS:
@@ -1736,7 +1736,7 @@ def decide(event: Dict[str, Any], config: Dict[str, Any], readonly: bool = False
     if is_mcp_tool(tool_name):
         if mcp_allowed(tool_name, config):
             return "allow", f"MCP tool {tool_name} is in the allowlist."
-        return llm_decide(event, f"MCP tool {tool_name} is not in the deterministic allowlist.", readonly=readonly)
+        return llm_decide(event, f"MCP tool {tool_name} is not in the deterministic allowlist.", readonly=readonly, permission_mode=permission_mode)
 
     # 4. Write/Edit/NotebookEdit/DeleteFile in readonly mode: always ask, with one exception:
     #    plan mode is allowed to write .md files under ~/.claude/plans.
@@ -1771,10 +1771,10 @@ def decide(event: Dict[str, Any], config: Dict[str, Any], readonly: bool = False
             bash_decision, bash_reason = classify_bash(command)
         if bash_decision:
             return bash_decision, bash_reason
-        return llm_decide(event, bash_reason, readonly=readonly)
+        return llm_decide(event, bash_reason, readonly=readonly, permission_mode=permission_mode)
 
     # 7. For edits/writes/agents/unknown tools, use LLM fallback.
-    return llm_decide(event, "Tool is not covered by deterministic policy.", readonly=readonly)
+    return llm_decide(event, "Tool is not covered by deterministic policy.", readonly=readonly, permission_mode=permission_mode)
 
 
 def handle_post_tool_use(event: Dict[str, Any]) -> None:
