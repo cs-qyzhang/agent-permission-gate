@@ -118,7 +118,7 @@ The hook has **two policy tiers**: **Normal** and **Readonly**. The IDE's curren
 
 | Qoder mode | Detected from | Mapped mode | Default tier |
 |---|---|---|---|
-| **Chat** | Transcript `session_meta` | `default` | **Readonly** |
+| **Ask/Chat** | Transcript `session_meta` | `default` | **Readonly** |
 | **Agent** | Transcript `session_meta` | `auto` | **Normal** |
 
 Qoder CLI sends permission modes directly (same values as Claude Code). If the transcript cannot be read, falls back to `PERMISSION_GATE_QODER_MODE`.
@@ -212,6 +212,34 @@ Note: Even these safe subcommands are escalated to LLM fallback if they contain 
 `ls`, `cat`, `head`, `tail`, `wc`, `du`, `df`, `file`, `stat`, `tree`, `find` (without `-delete`/`-exec`), `fd`, `rg`, `grep`, `pwd`, `date`, `whoami`, `uname`, `hostname`, `which`, `command`, `type`, `true`, `false`
 
 Commands with shell control operators (`&&`, `||`, `|`, `;`, `` ` ``, `$()`, `>`, `<`, newlines) or references to sensitive paths are escalated to LLM fallback.
+
+## Status Line
+
+`statusline-command.sh` displays real-time info in the status bar: current model, working directory, git branch, and context window remaining percentage.
+
+Example output:
+
+```
+deepseek-v4-pro[1m] | agent-permission-gate | main | context left: 85%
+```
+
+### Configuration
+
+Add a `statusLine` entry to your IDE's settings file:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "bash ~/.claude/agent-permission-gate/statusline-command.sh"
+  }
+}
+```
+
+### Dependencies
+
+- `jq` is recommended for JSON parsing
+- Falls back to `python3` (bundled with most systems)
 
 ## Testing
 
