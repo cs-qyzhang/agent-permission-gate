@@ -3,11 +3,18 @@
 
 # Logs
 permission.log
+permission-*.log
 
 # Permission gate memory database
 permission_gate_memory.db
 permission_gate_memory.db-wal
 permission_gate_memory.db-shm
+permission_gate_memory_*.db
+permission_gate_memory_*.db-wal
+permission_gate_memory_*.db-shm
+
+# Debug dump
+debug_input.jsonl
 
 # Python
 __pycache__/

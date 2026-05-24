@@ -5,7 +5,7 @@
 # ///
 
 """
-Claude Code PreToolUse permission gate.
+Permission gate hook for Claude Code and Qoder (通义灵码).
 
 Policy:
 - Always allow WebFetch / WebSearch.
@@ -14,6 +14,9 @@ Policy:
 - For uncertain cases, ask a configured Anthropic model to decide allow vs ask.
 - Avoid direct deny by default. Dangerous or uncertain actions become ask.
 
+Auto-detects the IDE (Claude Code vs Qoder) from the hook event JSON and
+adapts tool-name normalization and logging accordingly.
+
 Environment (can also be set via .env file in the script's directory):
 - PERMISSION_GATE_LLM_API_KEY: required only for LLM fallback.
 - PERMISSION_GATE_LLM_BASE_URL: optional base URL for custom Anthropic-compatible API.
@@ -21,6 +24,8 @@ Environment (can also be set via .env file in the script's directory):
 - PERMISSION_GATE_CONFIG: optional config JSON path.
 - PERMISSION_GATE_ENABLE_DENY: set to "1" if you want model-produced deny to be honored.
 - PERMISSION_GATE_LLM_TIMEOUT: API timeout seconds; default: 20.
+- PERMISSION_GATE_QODER_MODE: default permission mode for Qoder ("auto", "default", etc.)
+- PERMISSION_GATE_DEBUG: set to "1" to dump raw hook input + env to debug_input.jsonl.
 """
 
 from __future__ import annotations
@@ -76,16 +81,88 @@ MODEL = os.environ.get("PERMISSION_GATE_MODEL", "claude-haiku-4-5")
 BASE_URL = os.environ.get("PERMISSION_GATE_LLM_BASE_URL") or None
 LLM_TIMEOUT = float(os.environ.get("PERMISSION_GATE_LLM_TIMEOUT", "20"))
 ENABLE_DENY = os.environ.get("PERMISSION_GATE_ENABLE_DENY", "0") == "1"
+DEBUG_MODE = os.environ.get("PERMISSION_GATE_DEBUG", "0") == "1"
 
-# Keep stdout clean: Claude Code expects JSON decision output on stdout.
-LOG_PATH = os.path.expanduser(os.environ.get("PERMISSION_GATE_LOG", ""))
+# ---------------------------------------------------------------------------
+# IDE detection and per-IDE paths (initialized lazily after parsing stdin)
+# ---------------------------------------------------------------------------
 
-# SQLite memory for tracking LLM-ask → user-executed overrides per session.
-MEMORY_DB_PATH = os.path.expanduser(
-    os.environ.get("PERMISSION_GATE_MEMORY_DB",
-                   str(SCRIPT_DIR / "permission_gate_memory.db"))
-)
+_IDE_TYPE: Optional[str] = None
+_LOG_PATH: Optional[str] = None
+_MEMORY_DB_PATH: Optional[str] = None
+
 MAX_OVERRIDES = 5  # Max user-override records kept per session.
+
+
+def _detect_ide_type(event: Dict[str, Any]) -> str:
+    """Detect IDE type from the transcript_path directory structure.
+
+    - Claude Code: transcript_path contains a '.claude' directory component.
+    - Qoder (IDE + CLI): transcript_path contains '.qoder' or '.qoder-cn',
+      or no transcript_path at all.
+    """
+    transcript_path = str(event.get("transcript_path", ""))
+    path_parts = Path(transcript_path).parts
+    if ".claude" in path_parts:
+        return "claude"
+    return "qoder"
+
+
+def _init_ide_paths(ide_type: str) -> None:
+    """Initialize log and DB paths based on detected IDE type."""
+    global _IDE_TYPE, _LOG_PATH, _MEMORY_DB_PATH
+    _IDE_TYPE = ide_type
+    _LOG_PATH = str(SCRIPT_DIR / f"permission-{ide_type}.log")
+    _MEMORY_DB_PATH = str(SCRIPT_DIR / f"permission_gate_memory_{ide_type}.db")
+
+
+def _normalize_qoder_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize Qoder native tool names to Claude Code compatible names."""
+    tool_name = event.get("tool_name", "")
+    if tool_name in QODER_NATIVE_TOOLS:
+        event = dict(event)
+        event["tool_name"] = QODER_NATIVE_TOOLS[tool_name]
+    return event
+
+
+def _read_qoder_mode(transcript_path: str) -> Optional[str]:
+    """Read Qoder mode from the first line of the transcript JSONL file.
+
+    The first line is a session_meta record containing:
+    {"type":"session_meta","data":{"content":{"mode":"chat|agent",...}}}
+    """
+    if not transcript_path:
+        return None
+    try:
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            first_line = f.readline().strip()
+            if not first_line:
+                return None
+            data = json.loads(first_line)
+            if data.get("type") == "session_meta":
+                return data.get("data", {}).get("content", {}).get("mode")
+    except Exception:
+        pass
+    return None
+
+
+def _get_effective_permission_mode(event: Dict[str, Any]) -> str:
+    """Get permission mode from the event, transcript, or env default."""
+    mode = event.get("permission_mode")
+    if mode is not None:
+        return str(mode)
+
+    # Qoder IDE: read mode from transcript file (chat -> readonly, agent -> normal)
+    transcript_path = str(event.get("transcript_path", ""))
+    path_parts = Path(transcript_path).parts
+    if ".qoder" in path_parts or ".qoder-cn" in path_parts:
+        qoder_mode = _read_qoder_mode(transcript_path)
+        if qoder_mode == "chat":
+            return "default"  # readonly
+        if qoder_mode == "agent":
+            return "auto"  # normal
+
+    return os.environ.get("PERMISSION_GATE_QODER_MODE", "default")
 
 
 WEB_TOOLS = {
@@ -118,6 +195,21 @@ INTERNAL_TOOLS = {
     "CronList",
     "ScheduleWakeup",
     "TodoWrite",
+}
+
+# Qoder uses native tool names that differ from Claude Code's compatible names.
+# Map Qoder native names → Claude Code compatible names so the rest of the
+# classifier logic can stay unchanged.
+QODER_NATIVE_TOOLS: Dict[str, str] = {
+    "run_in_terminal": "Bash",
+    "read_file": "Read",
+    "create_file": "Write",
+    "search_replace": "Edit",
+    "delete_file": "DeleteFile",
+    "grep_code": "Grep",
+    "search_file": "Glob",
+    "list_dir": "LS",
+    "task": "Agent",
 }
 
 
@@ -189,14 +281,17 @@ SHELL_CONTROL_PATTERNS = [
 
 
 # ---------------------------------------------------------------------------
-# Claude Code output helpers
+# Output helpers
 # ---------------------------------------------------------------------------
 
 def emit(decision: str, reason: str) -> None:
     """
-    Emit Claude Code PreToolUse decision JSON and exit.
+    Emit PreToolUse decision JSON and exit.
 
-    decision must be one of: allow, ask, deny, defer.
+    - Claude Code: exit 0 + stdout JSON is the only control mechanism.
+    - Qoder: exit code is the primary mechanism. exit 2 blocks directly.
+      We still print JSON for completeness, but use exit 2 for deny
+      to ensure the block happens even if JSON parsing fails.
     """
     print(json.dumps(
         {
@@ -208,6 +303,10 @@ def emit(decision: str, reason: str) -> None:
         },
         ensure_ascii=False,
     ))
+    # Qoder uses exit code as the primary control mechanism.
+    # exit 2 blocks directly without relying on JSON parsing.
+    if _IDE_TYPE == "qoder" and decision == "deny":
+        raise SystemExit(2)
     raise SystemExit(0)
 
 
@@ -220,10 +319,10 @@ def ask(reason: str) -> None:
 
 
 def log_debug(message: str) -> None:
-    if not LOG_PATH:
+    if not _LOG_PATH:
         return
     try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(message.rstrip() + "\n")
     except Exception:
         pass
@@ -244,7 +343,8 @@ def _get_memory_db() -> sqlite3.Connection:
     """Get a cached SQLite connection with WAL mode and busy timeout."""
     global _memory_db_conn
     if _memory_db_conn is None:
-        _memory_db_conn = sqlite3.connect(MEMORY_DB_PATH, timeout=5)
+        db_path = _MEMORY_DB_PATH or str(SCRIPT_DIR / "permission_gate_memory_claude.db")
+        _memory_db_conn = sqlite3.connect(db_path, timeout=5)
         _memory_db_conn.execute("PRAGMA journal_mode=WAL")
         _memory_db_conn.execute("PRAGMA busy_timeout=3000")
         _memory_db_conn.execute("""
@@ -974,7 +1074,7 @@ def safe_node_package_manager(tokens: List[str]) -> bool:
 # LLM fallback
 # ---------------------------------------------------------------------------
 
-LLM_SYSTEM_PROMPT = """You are a tool permission classifier for Claude Code.
+LLM_SYSTEM_PROMPT = """You are a tool permission classifier for an AI coding assistant.
 
 Your ONLY job is to decide whether a proposed tool use should be automatically allowed or should ask the user first.
 
@@ -1147,7 +1247,7 @@ Output: {"decision":"ask","reason":"Force push is irrevocably destructive even w
 """
 
 
-LLM_READONLY_SYSTEM_PROMPT = """You are a tool permission classifier for Claude Code in READ-ONLY mode.
+LLM_READONLY_SYSTEM_PROMPT = """You are a tool permission classifier for an AI coding assistant in READ-ONLY mode.
 
 Your ONLY job is to decide whether a proposed tool use should be automatically allowed or should ask the user first.
 
@@ -1497,7 +1597,6 @@ def llm_decide(event: Dict[str, Any], preliminary_reason: str, readonly: bool = 
     session_id = str(event.get("session_id", ""))
     tool_name = str(event.get("tool_name", ""))
     tool_input = event.get("tool_input") or {}
-    permission_mode = str(event.get("permission_mode", "default"))
 
     system_prompt = LLM_READONLY_SYSTEM_PROMPT if readonly else LLM_SYSTEM_PROMPT
     mode_label = "READ-ONLY" if readonly else "NORMAL"
@@ -1510,7 +1609,7 @@ def llm_decide(event: Dict[str, Any], preliminary_reason: str, readonly: bool = 
     }
 
     first_user, recent_users = extract_user_inputs(event)
-    prompt_parts = [f"Classify this Claude Code tool call. [Mode: {mode_label}]\n"]
+    prompt_parts = [f"Classify this tool call. [Mode: {mode_label}]\n"]
 
     # Tell the LLM which round the conversation is currently at.
     current_turn = None
@@ -1617,7 +1716,7 @@ def llm_decide(event: Dict[str, Any], preliminary_reason: str, readonly: bool = 
 # Main decision flow
 # ---------------------------------------------------------------------------
 
-def decide(event: Dict[str, Any], config: Dict[str, Any], readonly: bool = False) -> Tuple[str, str]:
+def decide(event: Dict[str, Any], config: Dict[str, Any], readonly: bool = False, permission_mode: str = "default") -> Tuple[str, str]:
 
     tool_name = str(event.get("tool_name", ""))
     tool_input = event.get("tool_input") or {}
@@ -1639,10 +1738,10 @@ def decide(event: Dict[str, Any], config: Dict[str, Any], readonly: bool = False
             return "allow", f"MCP tool {tool_name} is in the allowlist."
         return llm_decide(event, f"MCP tool {tool_name} is not in the deterministic allowlist.", readonly=readonly)
 
-    # 4. Write/Edit/NotebookEdit in readonly mode: always ask, with one exception:
+    # 4. Write/Edit/NotebookEdit/DeleteFile in readonly mode: always ask, with one exception:
     #    plan mode is allowed to write .md files under ~/.claude/plans.
-    if readonly and tool_name in {"Write", "Edit", "NotebookEdit"}:
-        if event.get("permission_mode") == "plan":
+    if readonly and tool_name in {"Write", "Edit", "NotebookEdit", "DeleteFile"}:
+        if permission_mode == "plan" and tool_name != "DeleteFile":
             file_path = str(tool_input.get("file_path", ""))
             plan_dir = os.path.expanduser("~/.claude/plans")
             if file_path:
@@ -1691,40 +1790,73 @@ def handle_post_tool_use(event: Dict[str, Any]) -> None:
         _confirm_override(session_id, tool_name, tool_input)
 
 
+def _dump_raw_input(raw: str) -> None:
+    """Write raw input + full env snapshot to a debug file for troubleshooting.
+
+    Only runs when PERMISSION_GATE_DEBUG=1 is set.
+    """
+    if not DEBUG_MODE:
+        return
+    try:
+        debug_path = SCRIPT_DIR / "debug_input.jsonl"
+        entry = {
+            "ts": datetime.now().isoformat(),
+            "env": dict(os.environ),
+            "raw": raw[:50000] if raw else "",
+        }
+        with open(debug_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def main() -> None:
-    log_separator()
     try:
         raw = sys.stdin.read()
         event = json.loads(raw)
     except Exception as e:
+        # Can't detect IDE yet; use default paths so logging still works.
+        _init_ide_paths("claude")
         ask(f"Could not parse hook input JSON: {e}")
         return
 
+    _dump_raw_input(raw)
+
+    # Detect IDE type and initialize per-IDE paths before any logging.
+    ide_type = _detect_ide_type(event)
+    _init_ide_paths(ide_type)
+
+    # Normalize Qoder native tool names to Claude Code compatible names.
+    event = _normalize_qoder_event(event)
+
+    # PreToolUse: normal permission gating.
+    config = load_config()
+    current_mode = _get_effective_permission_mode(event)
+    if current_mode not in config["normal_modes"] and current_mode not in config["readonly_modes"]:
+        log_debug(f"[MODE] {current_mode} not in normal_modes or readonly_modes; passing through.")
+        sys.exit(0)
+
+    readonly = current_mode in config["readonly_modes"]
+
+    log_separator()
+
     hook_event = str(event.get("hook_event_name", "PreToolUse"))
-    log_debug(f"[INPUT] hook={hook_event} " + json.dumps(event, ensure_ascii=False)[:8000])
+    log_debug(f"[INPUT] ide={ide_type} mode={current_mode} hook={hook_event} " + json.dumps(event, ensure_ascii=False)[:8000])
 
     # PostToolUse: silently confirm pending asks — no output needed.
     if hook_event == "PostToolUse":
         handle_post_tool_use(event)
         sys.exit(0)
 
-    # PreToolUse: normal permission gating.
-    config = load_config()
-    current_mode = event.get("permission_mode", "default")
-    if current_mode not in config["normal_modes"] and current_mode not in config["readonly_modes"]:
-        log_debug(f"[MODE] {current_mode} not in normal_modes or readonly_modes; passing through.")
-        sys.exit(0)
-
-    readonly = current_mode in config["readonly_modes"]
     if readonly:
         log_debug(f"[MODE] {current_mode} is in readonly_modes; applying read-only policy.")
 
     try:
-        decision, reason = decide(event, config, readonly=readonly)
+        decision, reason = decide(event, config, readonly=readonly, permission_mode=current_mode)
     except Exception as e:
         decision, reason = "ask", f"Permission gate internal error: {type(e).__name__}: {e}"
 
-    log_debug(f"[OUTPUT] decision={decision} reason={reason}")
+    log_debug(f"[OUTPUT] mode={current_mode} decision={decision} reason={reason}")
 
     if decision == "allow":
         allow(reason)

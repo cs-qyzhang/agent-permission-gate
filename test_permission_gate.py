@@ -208,7 +208,7 @@ def build_prompt(scenario: Dict[str, Any]) -> str:
         "preliminary_reason": "Test scenario — classify this tool call.",
     }
     parts = [
-        "Classify this Claude Code tool call.",
+        "Classify this tool call.",
         f"Project working directory: {scenario.get('cwd', 'unknown')}",
         "<tool_request>",
         json.dumps(compact, ensure_ascii=False, indent=2),

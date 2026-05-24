@@ -1,21 +1,33 @@
-# Claude Code Permission Gate
+# AI Assistant Permission Gate
 
-A PreToolUse hook for Claude Code that classifies tool calls and decides whether to allow, ask the user, or deny them.
+A PreToolUse / PostToolUse hook for **Claude Code** and **Qoder (通义灵码)** that classifies tool calls and decides whether to allow, ask, or deny them.
+
+The script auto-detects the IDE (Claude Code, Qoder IDE, or Qoder CLI), reads the current permission mode, and adapts tool-name normalization, logging, and database paths accordingly.
+
+> For implementation details — return mechanisms, tool name mapping, database schema, IDE-specific behavior — see [DETAILS.md](DETAILS.md).
 
 ## How It Works
 
-1. **Deterministic allowlist** — Safe operations (internal tools, read-only built-in tools, git status/diff/log, uv/pip/npm package management, linting, type checking, read-only shell commands, etc.) are allowed immediately with no latency.
-2. **LLM fallback** — For uncertain cases (edits, writes, agents, unknown tools, ambiguous bash commands), the hook sends a compact summary including recent user messages to a configured model (`claude-haiku-4-5` by default) for classification.
+1. **Deterministic allowlist** — Safe operations (reads, git status/diff/log, uv/pip/npm installs, linting, type checking, etc.) are allowed immediately with no latency.
+2. **LLM fallback** — Uncertain cases (edits, writes, agents, unknown tools, ambiguous bash commands) are sent to a configured model for classification.
 3. **No silent deny** — Dangerous actions become "ask" rather than "deny" by default. Explicit deny can be enabled with `PERMISSION_GATE_ENABLE_DENY=1`.
 
 ## Quick Start
 
 ```bash
+# Install uv if you haven't already
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone the hook
+git clone https://github.com/cs-qyzhang/agent-permission-gate.git ~/.claude/agent-permission-gate
+cd ~/.claude/agent-permission-gate
+
+# Configure
 cp .env.example .env
 # Edit .env with your API key and model preferences
 ```
 
-Then configure Claude Code (`~/.claude/settings.json`) to use the hook:
+Add the hook to your IDE's settings file:
 
 ```json
 {
@@ -26,9 +38,8 @@ Then configure Claude Code (`~/.claude/settings.json`) to use the hook:
         "hooks": [
           {
             "type": "command",
-            "command": "uv run --script ~/.claude/claude-code-permission-gate/permission_gate.py",
-            "timeout": 20,
-            "statusMessage": "Checking tool permission"
+            "command": "uv run --script ~/.claude/agent-permission-gate/permission_gate.py",
+            "timeout": 20
           }
         ]
       }
@@ -39,7 +50,7 @@ Then configure Claude Code (`~/.claude/settings.json`) to use the hook:
         "hooks": [
           {
             "type": "command",
-            "command": "uv run --script ~/.claude/claude-code-permission-gate/permission_gate.py",
+            "command": "uv run --script ~/.claude/agent-permission-gate/permission_gate.py",
             "timeout": 10
           }
         ]
@@ -49,7 +60,21 @@ Then configure Claude Code (`~/.claude/settings.json`) to use the hook:
 }
 ```
 
-The PostToolUse hook is optional but recommended — it enables the **user override memory** feature (see below).
+The PostToolUse hook is optional but recommended — it enables the **user override memory** feature.
+
+Place the JSON above in the appropriate file for your platform:
+
+| Platform | Settings file |
+|---|---|
+| **Claude Code** | `~/.claude/settings.json` |
+| **Qoder IDE** (International) | `~/.qoder/settings.json` |
+| **Qoder CN IDE** (China / 通义灵码) | `~/.qoder-cn/settings.json` |
+| **Qoder CLI** (International) | `~/.qoder/settings.json` |
+| **Qoder CN CLI** (China / 通义灵码) | `~/.qoder-cn/settings.json` |
+
+**Qoder IDE prerequisite:** Set **Terminal in Agent Mode** to **Auto-run** in the IDE settings. This ensures the hook's `ask` decisions are handled properly rather than blocking indefinitely.
+
+![Qoder IDE Auto-Run Settings](qoder-ide-settings.png)
 
 ## Configuration (via `.env`)
 
@@ -58,60 +83,49 @@ The PostToolUse hook is optional but recommended — it enables the **user overr
 | `PERMISSION_GATE_LLM_API_KEY` | API key for LLM fallback decisions | (required for LLM fallback) |
 | `PERMISSION_GATE_LLM_BASE_URL` | Custom Anthropic-compatible API endpoint | `https://api.anthropic.com` |
 | `PERMISSION_GATE_MODEL` | Model for fallback classification | `claude-haiku-4-5` |
-| `PERMISSION_GATE_CONFIG` | Path to JSON config file for MCP allowlists | `~/.claude/hooks/config.json` |
+| `PERMISSION_GATE_CONFIG` | Path to JSON config file for MCP allowlists | `config.json` (in the script's directory) |
 | `PERMISSION_GATE_ALLOWED_MCP_TOOLS` | Comma-separated extra MCP tool names to allow | (none) |
 | `PERMISSION_GATE_ALLOWED_MCP_PATTERNS` | Comma-separated extra MCP regex patterns to allow | (none) |
-| `PERMISSION_GATE_LOG` | Path for debug logs | (disabled if empty) |
 | `PERMISSION_GATE_ENABLE_DENY` | Set to `1` to honor model-produced deny | `0` |
 | `PERMISSION_GATE_LLM_TIMEOUT` | API timeout in seconds | `20` |
-
-## What's Allowed by Default
-
-### Internal tools (always allowed)
-TaskCreate, TaskGet, TaskList, TaskUpdate, TaskOutput, TaskStop, Skill, AskUserQuestion, EnterPlanMode, ExitPlanMode, CronCreate, CronDelete, CronList, ScheduleWakeup
-
-### Web access (always allowed)
-WebFetch, WebSearch
-
-### Read-only built-in tools
-Read, Glob, Grep, LS (unless referencing sensitive paths like `.env`, `.ssh`, credentials, etc.)
-
-### Safe git commands
-`status`, `diff`, `log`, `show`, `branch`, `rev-parse`, `ls-files`, `grep`, `blame`, `remote`, `describe`, `tag` (excluding state-changing operations like push, commit, reset, checkout, merge, rebase, etc.)
-
-### Python/uv tooling
-- **uv**: `sync`, `add`, `remove`, `lock`, `tree`, `pip list`, `pip install`, `pip uninstall`, `python list`, `tool install`, `venv`, and `uv run` wrapping safe Python commands (below)
-- **Test runners**: `pytest`, `python -m pytest`, `python -m unittest`, `coverage run -m pytest`, `coverage report`, `coverage html`
-- **Linters/type checkers**: `ruff check` (without `--fix`), `ruff format --check`, `mypy`, `pyright`, `basedpyright`, `pyre`
-- **Formatters (check-only)**: `black --check`, `isort --check-only`/`--check`
-
-### Node.js package managers
-`npm`, `pnpm`, `yarn` with subcommands: `install`, `ci`, `add`, `remove`, `run`, `exec`, `start`, `test`, `build`, `lint`, `format`, `info`, `version`, `list`, `ls`, `outdated`, `view`, `pack`, `init`
-
-### Read-only shell commands
-`ls`, `cat`, `head`, `tail`, `wc`, `du`, `df`, `file`, `stat`, `tree`, `find` (without `-delete`/`-exec`), `fd`, `rg`, `grep`, `pwd`, `date`, `whoami`, `uname`, `hostname`, `which`, `command`, `type`, `true`, `false`
-
-Commands with shell control operators (`&&`, `||`, `|`, `;`, `` ` ``, `$()`, `>`, `<`, newlines) or references to sensitive paths are escalated to LLM fallback.
+| `PERMISSION_GATE_QODER_MODE` | Fallback permission mode for Qoder when mode cannot be detected from transcript | `default` |
+| `PERMISSION_GATE_DEBUG` | Set to `1` to dump raw hook input and environment to `debug_input.jsonl` | `0` |
 
 ## Permission Modes
 
-Claude Code has 6 permission modes that control how tool calls are approved. The hook receives the current mode in each event and can skip its custom logic for modes you trust, letting Claude Code's built-in permission system handle them instead.
+The hook has **two policy tiers**: **Normal** and **Readonly**. The IDE's current permission mode determines which tier is applied.
 
-| Mode | UI Name | What runs without asking |
+### Default mapping
+
+| Policy tier | Default modes | What is allowed |
 |---|---|---|
-| `default` | Ask before edits | Reads only |
-| `acceptEdits` | Edit automatically | Reads, file edits, common filesystem commands |
-| `plan` | Plan mode | Reads only (no source edits) |
-| `auto` | Auto mode | Everything (with built-in classifier safety checks) |
-| `dontAsk` | — | Only pre-approved tools via `permissions.allow` rules |
-| `bypassPermissions` | Bypass permissions | Everything (no checks) |
+| **Normal** | `auto`, `acceptEdits`, `dontAsk` | Standard development operations: editing, testing, package installs, etc. |
+| **Readonly** | `plan`, `default` | Read/analysis only: no file modification or package installs |
+| *(Pass-through)* | `bypassPermissions` | Hook does not intervene; IDE handles permission directly |
 
-The hook supports two policy tiers, configured in `config.json`:
+### Claude Code modes
 
-- **`normal_modes`**: The hook applies its standard allowlist — allows safe development operations (editing, testing, package installs, etc.).
-- **`readonly_modes`**: The hook applies a stricter read-only policy — only read/analysis operations, no file modification or package installs.
+| Mode | UI Name | Default tier |
+|---|---|---|
+| `default` | Ask before edits | **Readonly** |
+| `acceptEdits` | Edit automatically | **Normal** |
+| `plan` | Plan mode | **Readonly** |
+| `auto` | Auto mode | **Normal** |
+| `dontAsk` | — | **Normal** |
+| `bypassPermissions` | Bypass permissions | *(Pass-through)* |
 
-Both activate the hook; the difference is the policy level. Modes not in either list fall through to Claude Code's built-in permission system — each mode's default behavior (e.g. `default` mode auto-allows reads, `acceptEdits` auto-allows reads and edits) applies without the hook's intervention.
+### Qoder modes
+
+| Qoder mode | Detected from | Mapped mode | Default tier |
+|---|---|---|---|
+| **Chat** | Transcript `session_meta` | `default` | **Readonly** |
+| **Agent** | Transcript `session_meta` | `auto` | **Normal** |
+
+Qoder CLI sends permission modes directly (same values as Claude Code). If the transcript cannot be read, falls back to `PERMISSION_GATE_QODER_MODE`.
+
+### Customizing the mapping
+
+Edit `config.json` in the script's directory to change which modes map to which tier:
 
 ```json
 {
@@ -120,16 +134,22 @@ Both activate the hook; the difference is the policy level. Modes not in either 
 }
 ```
 
+- Add a mode to `normal_modes` to apply the standard allowlist.
+- Add a mode to `readonly_modes` to apply the stricter read-only policy.
+- Remove a mode from both lists to let the IDE handle it directly (pass-through).
+
+### Readonly policy details
+
 When the current mode is in `readonly_modes`:
 
-- **Write/Edit/NotebookEdit** tools are always "ask" — file modification is not allowed.
-- **Bash** only allows truly read-only commands: `ls`, `cat`, `grep`, `find` (without `-delete`/`-exec`), `git status`/`diff`/`log`, etc. Package managers (`uv sync`, `npm install`), test runners (`pytest`), and code execution are NOT allowed.
-- **WebSearch/WebFetch** are still allowed (read-only network access).
-- **LLM fallback** uses a stricter system prompt (`LLM_READONLY_SYSTEM_PROMPT`) that prioritizes read-only safety — even commonly safe commands like `pytest` or `uv sync` will be rejected.
+- **Write/Edit/NotebookEdit/DeleteFile** tools are always "ask".
+- **Bash** only allows read-only commands (`ls`, `cat`, `grep`, `git status`/`diff`/`log`, etc.). Package managers, test runners, and code execution are NOT allowed.
+- **WebSearch/WebFetch** are still allowed.
+- **LLM fallback** uses a stricter prompt that rejects even commonly safe commands like `pytest` or `uv sync`.
 
 ## MCP Tool Allowlist
 
-MCP tools are blocked by default. Add trusted tools in `~/.claude/hooks/config.json`:
+MCP tools are blocked by default. Add trusted tools in `config.json` (in the script's directory):
 
 ```json
 {
@@ -155,62 +175,43 @@ When a tool call doesn't match any deterministic rule, the hook sends a compact 
 - The first user message and up to 3 most recent user messages (with turn numbers)
 - A preliminary reason for why deterministic classification was skipped
 
-The LLM is instructed with a detailed system prompt covering allow/ask policies for file operations, git commands, network requests, privileged operations, and Agent/subagent tool use. The model classifies subagent (Agent tool) requests based on the task description — code exploration, review, debugging, and standard development tasks are allowed; destructive or sensitive operations are escalated to "ask".
+The LLM is instructed with a detailed system prompt covering allow/ask policies for file operations, git commands, network requests, privileged operations, and Agent/subagent tool use.
 
 ## User Override Memory
 
-When the PostToolUse hook is configured, the permission gate tracks cases where the LLM classified a tool as "ask" but the user chose to execute it anyway. This history is stored per-session in a SQLite database (`~/.claude/hooks/permission_gate_memory.db` by default).
+When the PostToolUse hook is configured, the permission gate tracks cases where the LLM classified a tool as "ask" but the user chose to execute it anyway. This history is stored per-session and per-permission-mode in a SQLite database in the script's directory. Separate databases are used for Claude Code and Qoder, and within each database overrides are keyed by permission mode — chat-mode approvals do not leak into agent-mode decisions.
 
-On subsequent LLM fallbacks, the **5 most recent overrides** for the current session are injected into the classification prompt, helping the LLM calibrate its decision threshold to the user's actual preferences.
+See [DETAILS.md](DETAILS.md) for full implementation details.
 
-### How it works
+## What's Allowed by Default
 
-1. **PreToolUse**: LLM decides "ask" → a pending entry is recorded in the DB.
-2. **PostToolUse**: The tool executes (user approved) → the pending entry is confirmed as a user override.
-3. **Next LLM fallback**: The recent overrides are included in the prompt:
-   ```
-   ## Recent user overrides in this session
-   Below are recent cases where the LLM classified a tool as "ask"
-   but the user chose to execute it...
-   1. Bash: npm install lodash
-   2. Edit: file_path: /home/user/project/src/config.py
-   ```
+### Internal tools (always allowed)
+TaskCreate, TaskGet, TaskList, TaskUpdate, TaskOutput, TaskStop, Skill, AskUserQuestion, EnterPlanMode, ExitPlanMode, CronCreate, CronDelete, CronList, ScheduleWakeup, TodoWrite
 
-If the user denies a tool (no PostToolUse fires), the stale pending entry is cleaned up on the next PreToolUse invocation.
+### Web access (always allowed)
+WebFetch, WebSearch
 
-### Configuration
+### Read-only built-in tools
+Read, Glob, Grep, LS (unless referencing sensitive paths: `.env`, `.envrc`, `.ssh/`, `id_rsa`, `.aws/`, `.kube/config`, `secrets.yml`, `credentials.json`, `.npmrc`, `.pypirc`, `.netrc`, `.docker/config.json`, `.vault-token`, `token.json`, `private_key`, `.pem`, etc.)
 
-| Variable | Description | Default |
-|---|---|---|
-| `PERMISSION_GATE_MEMORY_DB` | Path to the SQLite memory database | `~/.claude/hooks/permission_gate_memory.db` |
+### Safe git commands
+`status`, `diff`, `log`, `show`, `branch`, `rev-parse`, `ls-files`, `grep`, `blame`, `remote`, `describe`, `tag`
 
-## Status Line
+Note: Even these safe subcommands are escalated to LLM fallback if they contain unsafe fragments like `config`, `push`, `pull`, `fetch`, `clone`, `reset`, `checkout`, `switch`, `merge`, `rebase`, `commit`, `add`, `restore`, `clean`, `stash push/pop/apply`.
 
-`statusline-command.sh` displays real-time info in Claude Code's status bar: current model, working directory, git branch, and context window remaining percentage.
+### Python/uv tooling
+- **uv**: `sync`, `add`, `remove`, `lock`, `tree`, `pip list`, `pip install`, `pip uninstall`, `python list`, `tool install`, `venv`, `version`/`--version`, and `uv run` wrapping safe Python commands (below)
+- **Test runners**: `pytest`, `python -m pytest`, `python -m unittest`, `coverage run -m pytest`, `coverage report`, `coverage html`
+- **Linters/type checkers**: `ruff check` (without `--fix`), `ruff format --check`, `mypy`, `pyright`, `basedpyright`, `pyre`, `pylint`
+- **Formatters (check-only)**: `black --check`, `isort --check-only`/`--check`
 
-Example output:
+### Node.js package managers
+`npm`, `pnpm`, `yarn` with subcommands: `install`, `ci`, `add`, `remove`, `run`, `exec`, `start`, `test`, `build`, `lint`, `format`, `info`, `version`, `list`, `ls`, `outdated`, `view`, `pack`, `init`
 
-```
-deepseek-v4-pro[1m] | claude-code-permission-gate | main | context left: 85%
-```
+### Read-only shell commands
+`ls`, `cat`, `head`, `tail`, `wc`, `du`, `df`, `file`, `stat`, `tree`, `find` (without `-delete`/`-exec`), `fd`, `rg`, `grep`, `pwd`, `date`, `whoami`, `uname`, `hostname`, `which`, `command`, `type`, `true`, `false`
 
-### Configuration
-
-Add a `statusLine` entry to `~/.claude/settings.json`:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "bash ~/.claude/claude-code-permission-gate/statusline-command.sh"
-  }
-}
-```
-
-### Dependencies
-
-- `jq` is recommended for JSON parsing
-- Falls back to `python3` (bundled with most systems)
+Commands with shell control operators (`&&`, `||`, `|`, `;`, `` ` ``, `$()`, `>`, `<`, newlines) or references to sensitive paths are escalated to LLM fallback.
 
 ## Testing
 
@@ -229,6 +230,6 @@ uv run python test_permission_gate.py --verbose
 ```
 
 The test suite covers:
-- **Parse tests**: JSON extraction from 20 different malformed LLM outputs (markdown fences, text wrapping, nested braces, etc.)
-- **Normalization tests**: Maps alternative field names from non-Anthropic APIs (MiniMax etc.) to `decision`/`reason`
-- **LLM integration tests**: 20 real scenarios covering safe and dangerous tool calls, verifying the model returns valid JSON with correct decision/reason fields
+- **Parse tests**: JSON extraction from 20 different malformed LLM outputs
+- **Normalization tests**: Maps alternative field names from non-Anthropic APIs to `decision`/`reason`
+- **LLM integration tests**: 20 real scenarios covering safe and dangerous tool calls
