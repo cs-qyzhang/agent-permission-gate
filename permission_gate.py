@@ -1670,8 +1670,8 @@ def llm_decide(event: Dict[str, Any], preliminary_reason: str, readonly: bool = 
     prompt_parts.append("<tool_request>\n" + json.dumps(compact_event, ensure_ascii=False, indent=2)[:12000] + "\n</tool_request>")
     prompt = "\n".join(prompt_parts)
 
-    log_debug(f"[LLM-{mode_label}] system prompt:\n{system_prompt}")
-    log_debug(f"[LLM-{mode_label}] user prompt:\n{prompt}")
+    if DEBUG_MODE:
+        log_debug(f"[LLM-{mode_label}] user prompt:\n{prompt}")
 
     try:
         # The Anthropic SDK auto-reads ANTHROPIC_AUTH_TOKEN from the environment
@@ -1713,9 +1713,6 @@ def llm_decide(event: Dict[str, Any], preliminary_reason: str, readonly: bool = 
         # detect whether the user ultimately chose to execute.
         if decision == "ask":
             _record_pending_ask(session_id, tool_name, tool_input, permission_mode)
-
-        if decision == "deny":
-            return "deny", reason
 
         return decision, reason
 
