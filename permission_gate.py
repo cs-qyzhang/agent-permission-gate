@@ -126,21 +126,27 @@ def _normalize_qoder_event(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _read_qoder_mode(transcript_path: str) -> Optional[str]:
-    """Read Qoder mode from the first line of the transcript JSONL file.
+    """Read Qoder mode from the transcript JSONL file.
 
-    The first line is a session_meta record containing:
-    {"type":"session_meta","data":{"content":{"mode":"chat|agent",...}}}
+    A session may switch between chat/agent mode mid-session. Each mode
+    switch produces a new session_meta record. We scan all lines and
+    return the *last* session_meta mode to reflect the current state.
     """
     if not transcript_path:
         return None
     try:
+        mode = None
         with open(transcript_path, "r", encoding="utf-8") as f:
-            first_line = f.readline().strip()
-            if not first_line:
-                return None
-            data = json.loads(first_line)
-            if data.get("type") == "session_meta":
-                return data.get("data", {}).get("content", {}).get("mode")
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                data = json.loads(line)
+                if data.get("type") == "session_meta":
+                    m = data.get("data", {}).get("content", {}).get("mode")
+                    if m:
+                        mode = m
+        return mode
     except Exception:
         pass
     return None
@@ -292,17 +298,24 @@ def emit(decision: str, reason: str) -> None:
     - Qoder: exit code is the primary mechanism. exit 2 blocks directly.
       We still print JSON for completeness, but use exit 2 for deny
       to ensure the block happens even if JSON parsing fails.
+      For Qoder, the JSON follows the official Qoder CN hooks protocol:
+      https://help.aliyun.com/zh/lingma/qoder-cn/user-guide/hooks
     """
-    print(json.dumps(
-        {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": decision,
-                "permissionDecisionReason": reason[:500],
-            }
-        },
-        ensure_ascii=False,
-    ))
+    hook_specific = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": decision,
+        "permissionDecisionReason": reason[:500],
+    }
+    if _IDE_TYPE == "qoder":
+        output = {
+            "continue": decision != "deny",
+            "stopReason": reason[:500] if decision == "deny" else "",
+            "suppressOutput": decision == "deny",
+            "hookSpecificOutput": hook_specific,
+        }
+    else:
+        output = {"hookSpecificOutput": hook_specific}
+    print(json.dumps(output, ensure_ascii=False))
     # Qoder uses exit code as the primary control mechanism.
     # exit 2 blocks directly without relying on JSON parsing.
     if _IDE_TYPE == "qoder" and decision == "deny":
