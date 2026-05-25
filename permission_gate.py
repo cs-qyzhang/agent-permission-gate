@@ -315,7 +315,7 @@ def emit(decision: str, reason: str) -> None:
         }
     else:
         output = {"hookSpecificOutput": hook_specific}
-    print(json.dumps(output, ensure_ascii=False))
+    print(json.dumps(_scrub_surrogates(output), ensure_ascii=False))
     # Qoder uses exit code as the primary control mechanism.
     # exit 2 blocks directly without relying on JSON parsing.
     if _IDE_TYPE == "qoder" and decision == "deny":
@@ -336,7 +336,7 @@ def log_debug(message: str) -> None:
         return
     try:
         with open(_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(message.rstrip() + "\n")
+            f.write(_scrub_surrogates(message.rstrip()) + "\n")
     except Exception:
         pass
 
@@ -578,9 +578,28 @@ def load_config() -> Dict[str, Any]:
 # Generic safety helpers
 # ---------------------------------------------------------------------------
 
+_SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
+
+
+def _scrub_surrogates(obj: Any) -> Any:
+    """Replace lone surrogates (U+D800–U+DFFF) with U+FFFD in all strings.
+
+    Lone surrogates are invalid Unicode but valid JSON escape sequences.
+    Python's json module (C extension) rejects them when ensure_ascii=False
+    is used, raising UnicodeEncodeError. Pre-scrub to avoid this.
+    """
+    if isinstance(obj, str):
+        return _SURROGATE_RE.sub('�', obj)
+    if isinstance(obj, dict):
+        return {k: _scrub_surrogates(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_surrogates(item) for item in obj]
+    return obj
+
+
 def json_text(obj: Any) -> str:
     try:
-        return json.dumps(obj, ensure_ascii=False, sort_keys=True)
+        return json.dumps(_scrub_surrogates(obj), ensure_ascii=False, sort_keys=True)
     except Exception:
         return str(obj)
 
@@ -1667,7 +1686,7 @@ def llm_decide(event: Dict[str, Any], preliminary_reason: str, readonly: bool = 
                 continue
             prompt_parts.append(f'<user_message turn="{turn}">\n' + msg_text + "\n</user_message>\n")
     prompt_parts.append("## Tool request\n")
-    prompt_parts.append("<tool_request>\n" + json.dumps(compact_event, ensure_ascii=False, indent=2)[:12000] + "\n</tool_request>")
+    prompt_parts.append("<tool_request>\n" + json.dumps(_scrub_surrogates(compact_event), ensure_ascii=False, indent=2)[:12000] + "\n</tool_request>")
     prompt = "\n".join(prompt_parts)
 
     if DEBUG_MODE:
@@ -1815,7 +1834,7 @@ def _dump_raw_input(raw: str) -> None:
             "raw": raw[:50000] if raw else "",
         }
         with open(debug_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.write(json.dumps(_scrub_surrogates(entry), ensure_ascii=False) + "\n")
     except Exception:
         pass
 
@@ -1851,7 +1870,7 @@ def main() -> None:
     log_separator()
 
     hook_event = str(event.get("hook_event_name", "PreToolUse"))
-    log_debug(f"[INPUT] ide={ide_type} mode={current_mode} hook={hook_event} " + json.dumps(event, ensure_ascii=False)[:8000])
+    log_debug(f"[INPUT] ide={ide_type} mode={current_mode} hook={hook_event} " + json.dumps(_scrub_surrogates(event), ensure_ascii=False)[:8000])
 
     # PostToolUse: silently confirm pending asks — no output needed.
     if hook_event == "PostToolUse":
